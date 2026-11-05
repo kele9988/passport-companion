@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+known_devices.json
+wb-console.json
+wb-skip.json
+ghtmp*

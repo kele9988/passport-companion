@@ -56,6 +56,8 @@ python3 gateway.py --port 7802 --relay 127.0.0.1:7801
 - VB-CABLE 虚拟声卡驱动（音频回环/自检脚本需要）：[vb-audio.com/Cable](https://vb-audio.com/Cable/)
 - 语音输入到第三方应用等 AI 功能需要自行接入凭据（本仓库不包含任何凭据模块）。
 
+**远程访问（进阶）**：控制台默认绑定 `0.0.0.0:8090`（`--web-host` 可改），便于与 Cloudflare Tunnel 等反代配合。异地打开控制台的思路：在家里常驻机器上运行 `cloudflared tunnel --url http://localhost:8090`（或配置命名隧道 + 自己的域名），隧道出口即控制台。注意控制台页面本身没有登录鉴权，公网暴露请务必叠加 Cloudflare Access 等访问控制，不要裸奔。
+
 ## 许可证
 
 [MIT](LICENSE)

@@ -29,6 +29,32 @@ LOG = os.path.join(BASE, "wb_autostart.log")
 APP = os.path.join(BASE, "wb_app.py")
 WAIT_SECONDS = 20
 WEB_PORT = 8090  # 8080 is reserved for the local LLM server on this machine
+MUTEX_NAME = "Local\\WorkBuddyCompanionDaemon-v1"
+_MUTEX_HANDLE = None
+
+
+def acquire_single_instance() -> bool:
+    """拿命名互斥体，保证同一会话内只有一个守护实例。
+
+    2026-11-05 定位：HKCU Run 与计划任务两个入口会在开机时同时启动，
+    而端口检查发生在 20 秒等待之后，两者几乎同时通过检查 —— 结果起了两个
+    实例，任务栏出现两个图标，后一个还因 IPC 48765 抢占失败变成半死进程。
+    互斥体在等待之前获取，天然消除这个竞态。
+    """
+    global _MUTEX_HANDLE
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        if not handle:
+            return True  # 创建失败就放行：宁可重复一次，也不要完全起不来
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        _MUTEX_HANDLE = handle  # 持有引用，进程存活期间不释放
+        return True
+    except Exception:
+        return True
 
 
 def log(message: str) -> None:
@@ -49,6 +75,9 @@ def port_in_use(port: int) -> bool:
 
 
 def main() -> int:
+    if not acquire_single_instance():
+        log("boot launcher: another instance already running, skip")
+        return 0
     log(f"boot launcher: start, waiting {WAIT_SECONDS}s for shell/network")
     time.sleep(WAIT_SECONDS)
 

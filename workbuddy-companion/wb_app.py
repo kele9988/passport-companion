@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import webbrowser
 # 子进程调用时隐藏控制台窗口（Windows）：netstat/pip 等每次调用默认会闪一个
 # 黑色 cmd 框，尤其 ACP 发现循环每 10s 跑一次 netstat，不隐藏会持续弹窗。
@@ -44,6 +45,7 @@ import array
 import ctypes
 import queue
 from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 try:
     import winreg
@@ -569,12 +571,19 @@ def beep_vol_get(cfg: dict | None = None) -> int:
 # ---- 设备发消息：新任务默认参数（只存 PC 端，随控制台配置落盘） ----
 # 键名 wb_job_cwd / wb_job_agent / wb_job_model；空串表示不传（走 WorkBuddy 默认）。
 WB_JOB_CFG_KEYS = ("cwd", "agent", "model")
-# 默认工作目录：WorkBuddy 派发后台任务时的 cwd，缺省取当前工作区。
-WB_JOB_CWD_DEFAULT = "D:/wpslinxi/foloty"
+# 默认工作目录：空串 = 不传 cwd，由 WorkBuddy 用当前工作区。
+# 2026-11-05 之前这里写死过 "D:/wpslinxi/foloty"（早就删掉的目录），结果设备每次
+# 「新任务」都被服务端拒在启动前：Cannot start agent in D:/wpslinxi/foloty:
+# parent directory is missing。设备只看到乐观回执，表现为「发送完没反应」。
+WB_JOB_CWD_DEFAULT = ""
 
 
 def wb_job_cfg_get(cfg: dict | None = None) -> dict:
-    """取新任务默认参数（cwd/agent/model），缺键走缺省，坏值忽略。"""
+    """取新任务默认参数（cwd/agent/model），缺键走缺省，坏值忽略。
+
+    cwd 额外做存在性校验：配置里留着一个已删除的目录时按未配置处理，
+    否则后台任务会在创建阶段直接失败（失败发生在 HTTP 200 之后，设备收不到）。
+    """
     if cfg is None:
         cfg = console_cfg_load()
     out = {"cwd": WB_JOB_CWD_DEFAULT, "agent": "", "model": ""}
@@ -582,6 +591,8 @@ def wb_job_cfg_get(cfg: dict | None = None) -> dict:
         v = cfg.get(f"wb_job_{k}")
         if isinstance(v, str) and v.strip():
             out[k] = v.strip()
+    if out["cwd"] and not os.path.isdir(out["cwd"]):
+        out["cwd"] = ""
     return out
 
 
@@ -1147,13 +1158,29 @@ def wb_acp_deliver(text: str, session: dict | None = None) -> dict:
 
 
 def wb_cli_path() -> str:
-    """WorkBuddy CLI 入口：返回**能直接交给 node 跑**的那个 js/mjs 文件。
+    """CLI 入口：返回**能直接交给 node 跑**的那个 js 文件。
 
-    别死认 `bin/codebuddy`：它只是个薄包装，内部 require('../dist/codebuddy')，
-    而 WorkBuddy 2026-10-14 更新后 dist 里只剩 `codebuddy-lite-wb.mjs`
-    （改版换名），照旧路径跑只会得到 "Cannot find module '../dist/codebuddy'"。
-    这里按打包形态从"完整包"到"精简包"再到"老包装"依次探测，谁在就用谁。
+    优先级（2026-11-06 实测定型）：
+    1. 官方独立 CLI（npm @tencent-ai/codebuddy-code）——完整 dist + 独立登录态
+       （AppData/Local/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.*.info），
+       无头 -p 实测可用；WorkBuddy 关着也能建任务，是空窗期兜底的主力。
+    2. WorkBuddy 内置 CLI——2026-10-14 更新后 dist 只剩 lite-wb（TUI 已剔除），
+       只能作 last resort（且登录态依赖桌面端下发，经常不可用）。
     """
+    node_base = os.path.join(os.path.expanduser("~"), ".workbuddy", "binaries",
+                             "node", "versions")
+    try:
+        vers = sorted((d for d in os.listdir(node_base)
+                       if os.path.isdir(os.path.join(node_base, d))), reverse=True)
+    except OSError:
+        vers = []
+    for v in vers:
+        pkg = os.path.join(node_base, v, "node_modules", "@tencent-ai",
+                           "codebuddy-code")
+        for rel in (("dist", "codebuddy.js"), ("bin", "codebuddy")):
+            p = os.path.join(pkg, *rel)
+            if os.path.isfile(p):
+                return p
     la = os.environ.get("LOCALAPPDATA") or ""
     if not la:
         return ""
@@ -1169,35 +1196,774 @@ def wb_cli_path() -> str:
     return ""
 
 
+def _wb_dbg(msg: str) -> None:
+    """模块级调试日志：stdout 已被 wb_boot 重定向进 wb_autostart.log。"""
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:
+        pass
+
+
+def _prewarm_tool() -> tuple[str, str] | None:
+    """返回 (node, cbc-prewarm 脚本路径)；任一缺失返回 None。
+
+    cbc-prewarm 是桌面端自带的预热进程管理 CLI（纯 node 脚本、内置模块），
+    与 cli/dist 同级的 bin/ 下，毫秒级 list/ping/activate 预热 worker。
+    """
+    cli = wb_cli_path()
+    if not cli:
+        return None
+    node = wb_node_path()
+    if not node:
+        return None
+    prewarm = os.path.join(os.path.dirname(os.path.dirname(cli)), "bin", "cbc-prewarm")
+    if os.path.isfile(prewarm):
+        return (node, prewarm)
+    return None
+
+
+def _prewarm_ids() -> list[str]:
+    """枚举当前存活的预热 worker id。
+
+    优先走 cbc-prewarm list --all（读 ~/.codebuddy/sessions/ 注册文件）；
+    但注册文件会被桌面端清理而命名管道仍存活（实测 2026-11-05 20:47），
+    故 list 为空时回退：扫 WorkBuddy.exe 进程命令行提取 --prewarm-id。
+    """
+    tool = _prewarm_tool()
+    if not tool:
+        return []
+    node, script = tool
+    env = {k: v for k, v in os.environ.items() if k not in CLI_ENV_DROP}
+    ids: list[str] = []
+    try:
+        r = subprocess.run([node, script, "list", "--all"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=12, env=env, creationflags=SUB_NO_WINDOW)
+        for ln in (r.stdout or "").splitlines():
+            ln = ln.strip()
+            if '"id"' in ln:
+                try:
+                    o = json.loads(ln.strip().rstrip(","))
+                    v = o.get("id") if isinstance(o, dict) else None
+                    if isinstance(v, str):
+                        ids.append(v)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if ids:
+        return ids
+    # 回退：进程命令行提取（list 依赖的注册文件可能已被清理）
+    try:
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='WorkBuddy.exe'\" | "
+              "Select-Object -ExpandProperty CommandLine")
+        r2 = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=20, env=env,
+                            creationflags=SUB_NO_WINDOW)
+        import re
+        ids = re.findall(r"--prewarm-id\s+(\S+)", r2.stdout or "")
+    except Exception:
+        pass
+    return ids
+
+
+def _prewarm_wake(cwd: str, wait_s: float = 30.0) -> int | None:
+    """唤醒一个桌面预热 worker 用于新任务，返回其网关端口（失败 None）。
+
+    背景（2026-11-05 实测）：桌面守护常驻 1-2 个 `codebuddy --prewarm`
+    预热 worker（PID 见 WorkBuddy.exe 命令行 --prewarm-id wb-pool-*），
+    带完整登录态但尚未监听网关端口。网关空窗期（桌面端无活动会话，
+    实测可达数分钟）可以经 `cbc-prewarm activate <id> --cwd <dir>`
+    毫秒级把它激活成正式 serve worker；激活会消耗预热名额，桌面守护
+    会自动补一个新预热，池子自愈，可反复使用。
+
+    activate 后 worker 才开始监听 127.0.0.1:<port>，故需轮询端口表 +
+    probe_worker 探测。激活进程无任务保持时约 1 分钟后被回收 —— 拿到
+    端口后必须立刻投递（调用方负责）。
+    """
+    tool = _prewarm_tool()
+    if not tool:
+        return None
+    node, script = tool
+    env = {k: v for k, v in os.environ.items() if k not in CLI_ENV_DROP}
+
+    def _run(*args: str, timeout: float = 12.0):
+        return subprocess.run([node, script, *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=env,
+                              creationflags=SUB_NO_WINDOW)
+
+    ids = _prewarm_ids()
+    for pid_ in ids[:3]:
+        try:
+            st = _run("status", pid_)
+            if '"idle"' not in (st.stdout or ""):
+                continue
+            # 激活前快照：轮询只探测「新增」端口。全量探测会让每轮
+            # 承担 N×5s 的 connect 超时，把 wait_s 拖成几分钟（实测）。
+            before = set(_list_workbuddy_ports())
+            act = _run("activate", pid_, "--cwd", cwd or ".")
+            if '"ok": true' not in (act.stdout or ""):
+                continue
+        except Exception:
+            continue
+        _wb_dbg(f"预热 worker {pid_[:24]} 已激活，等待网关端口…")
+        deadline = time.time() + max(3.0, wait_s)
+        while time.time() < deadline:
+            time.sleep(1.5)
+            for p in _list_workbuddy_ports():
+                if p in before:
+                    continue
+                if probe_worker(p):
+                    _wb_dbg(f"预热 worker 端口就绪 :{p}")
+                    return p
+        break
+    return None
+
+
+# 从桌面端继承、但绝不能传给「新任务」子进程的环境变量：
+# SERVER__PORT 会把子进程钉在桌面 worker 的端口上（必然 EADDRINUSE）；
+# 其余几项会把子进程错当成当前会话的一部分（同一个 ACP 连接/沙箱占位）。
+CLI_ENV_DROP = (
+    "SERVER__PORT", "CODEBUDDY_SERVICE_PROXY_URL", "CODEBUDDY_SESSION_ID",
+    "CODEBUDDY_GATEWAY_PASSWORD", "CODEBUDDY_GATEWAY_AUTH", "CODEBUDDY_ARTIFACTS",
+    "CODEBUDDY_CONVERSATION_REQUEST_ID", "CODEBUDDY_CONVERSATION_MESSAGE_ID",
+    "CODEBUDDY_TOOL_CALL_ID", "CODEBUDDY_ROOT_REQUEST_ID", "CODEBUDDY_MCP_CONFIG",
+    "CODEBUDDY_DOCUMENT_IPC_ADDRESS", "CODEBUDDY_DOCUMENT_TOKEN", "EDITOR_SDK_PORT",
+    # 2026-11-06：桌面端溢出的产品配置会把 CLI 的产品身份钉在 workbuddy-desktop，
+    # 于是去读桌面的加密凭据文件（$wbEncrypted，守护没有解密密钥）→ 永远
+    # Authentication required。清掉后 CLI 回落到自带 product.json 的
+    # Tencent-Cloud.coding-copilot 身份，读独立 TUI 登录写下的明文凭据。
+    "ACC_PRODUCT_CONFIG", "ACC_PRODUCT_CONFIG_V2", "ACC_PRODUCT_CONFIG_V3",
+    "ACC_PRODUCT_CONFIG_PATH", "CODEBUDDY_FORCE_LITE_WB_BUNDLE",
+)
+
+
+def wb_node_path() -> str:
+    """找 node 可执行文件：PATH 优先，找不到就用 WorkBuddy 自带的。
+
+    为什么必须有第二段：守护经计划任务/pythonw 启动时环境很干净，PATH 里
+    往往没有 node（实测 CLI 兜底报 [WinError 2] 系统找不到指定的文件），
+    而 ~/.workbuddy/binaries/node/versions/ 下一定有桌面端自带的完整 node。
+    """
+    found = shutil.which("node")
+    if found:
+        return found
+    base = os.path.join(os.path.expanduser("~"), ".workbuddy", "binaries",
+                        "node", "versions")
+    try:
+        vers = sorted((d for d in os.listdir(base)
+                       if os.path.isfile(os.path.join(base, d, "node.exe"))),
+                      reverse=True)
+    except OSError:
+        return ""
+    return os.path.join(base, vers[0], "node.exe") if vers else ""
+
+
+def _cli_slug(cwd: str) -> str:
+    """把 cwd 变成两代 CLI 共用的项目目录名（c-Users-Administrator-...）。"""
+    s = (cwd or "").replace("\\", "/")
+    if len(s) > 1 and s[1] == ":":
+        s = s[0].lower() + s[1:]
+    out, prev_dash = [], False
+    for ch in s:
+        if ch.isalnum() and ch.isascii():
+            out.append(ch)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    return "".join(out).strip("-")
+
+
+def _cli_session_land(start: float, cwd: str | None, text: str,
+                      mode: str = "final") -> str:
+    """找到 CLI 刚落盘的会话 jsonl，按 mode 决定复制/登记行为。返回 sid。
+
+    为什么必须做：CLI headless 会话写在 ~/.codebuddy/projects/<slug>/，
+    桌面端只认 ~/.workbuddy/projects/<slug>/ + sessions 表，两处都不碰 ——
+    任务真跑完了侧边栏也永远不出现（2026-11-06 03:51 语音任务实测）。
+    两边 jsonl 是同一套 schema（session-meta/message/function_call），直接
+    复制即可被桌面端完整回放。定位靠「mtime >= start 且首条用户消息含原文」，
+    不猜 slug，cwd 为空也能找到。
+
+    mode（2026-11-06 04:40 定型）：
+    * "detect"   —— 只定位返回 sid，不复制不登记。为什么不再提前登记：
+                   半截 jsonl 回放到桌面后，进行中的回合被判「非终态」，
+                   冷启动回放路径 finalizeOrphanRequest 直接渲染成
+                   「任务被中断」，且会话视图被缓存，任务完成后重开也不
+                   恢复（04:33 engram 手册任务实测）。改为任务结束后一次
+                   性复制终版 + completed 登记，桌面打开必然是完整回放；
+                   运行中的状态由控制台「语音任务」卡片承担。
+    * "final"    —— 进程正常退出：复制终版 jsonl + completed 登记。
+    * "terminated" —— 超时/失败：复制当时的 jsonl（可能半截）+ terminated
+                   登记，让用户至少能看到任务死前的轨迹。
+    """
+    import glob
+    base = os.path.expanduser("~/.codebuddy/projects")
+    frag = (text or "").strip()[:16]
+    best = ""
+    for p in glob.glob(os.path.join(base, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(p) < start - 2:
+                continue
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                head = f.read(20000)
+        except OSError:
+            continue
+        if frag and frag not in head:
+            continue
+        if not best or os.path.getmtime(p) > os.path.getmtime(best):
+            best = p
+    if not best:
+        return ""
+    sid = os.path.splitext(os.path.basename(best))[0]
+    if mode == "detect":
+        return sid
+    try:
+        with open(best, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if content and not content.endswith("\n"):
+            content = content[:content.rfind("\n") + 1]   # 丢掉可能截断的末行
+        slug = _cli_slug(cwd) if cwd else os.path.basename(os.path.dirname(best))
+        dest_dir = os.path.join(os.path.expanduser("~/.workbuddy/projects"), slug)
+        os.makedirs(dest_dir, exist_ok=True)
+        with open(os.path.join(dest_dir, sid + ".jsonl"), "w",
+                  encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        _wbsess_note(f"CLI 会话复制失败 {sid[:8]}: {e}")
+        return sid
+    if cwd:
+        _wbsess_register(sid, cwd, text,
+                         status="completed" if mode == "final" else "terminated")
+    _wbsess_note(f"CLI 会话{'终版同步' if mode == 'final' else '已登记(terminated)'} {sid[:8]} cwd={cwd}")
+    return sid
+
+
 def wb_cli_new_job(text: str, cwd: str | None = None) -> dict:
     """CLI 回退：没有活的 serve 实例时，直接起一个 headless 会话（每次独立会话）。"""
     cli = wb_cli_path()
     if not cli:
         return {"ok": False, "kind": "job",
                 "err": "没有可用的 worker 端口，也没找到 WorkBuddy CLI"}
-    node = shutil.which("node") or "node"
+    node = wb_node_path()
+    if not node:
+        return {"ok": False, "kind": "job",
+                "err": "没找到 node（PATH 和 WorkBuddy 自带目录都没有）"}
+    started = time.time()
     try:
-        # encoding 必须显式给 utf-8：系统默认是 GBK，会把子进程输出里的中文解成乱码
-        # （报错信息里的用户名 忘尘 → 蹇樺皹，之前排查时被这个误导过）。
-        r = subprocess.run([node, cli, "-p", text], cwd=cwd or None,
-                           capture_output=True, text=True, timeout=180,
-                           encoding="utf-8", errors="replace",
-                           creationflags=SUB_NO_WINDOW)
+        # 2026-11-05：必须清掉从桌面端继承来的固定端口变量。桌面 worker 把
+        # SERVER__PORT=<它自己监听的端口> 传给子进程，CLI 会照搬去 listen，于是
+        # 必然 EADDRINUSE（`--port` 缺省本来会自动选端口）。顺带清掉会话/占位类
+        # 注入变量，免得这个「新任务」被挂到当前会话上。
+        env = {k: v for k, v in os.environ.items() if k not in CLI_ENV_DROP}
+        # 2026-11-06：subprocess.run 阻塞式等待整轮跑完（2~3 分钟）才返回，
+        # 期间侧边栏毫无动静，用户早已判定「没新建任务」。改为 Popen + 2s 轮询：
+        # CLI 的会话 jsonl 启动几秒内就落盘，一旦出现立即复制到桌面项目目录并
+        # 补登记 sessions 表，侧边栏十几秒内就能看到新任务在跑。
+        import tempfile
+        outf = tempfile.TemporaryFile()
+        errf = tempfile.TemporaryFile()
+        proc = subprocess.Popen([node, cli, "-p", text], cwd=cwd or None, env=env,
+                                stdout=outf, stderr=errf,
+                                creationflags=SUB_NO_WINDOW)
+        sid = ""
+        rc = None
+        # 2026-11-06：180s 是照搬旧 subprocess.run 的 timeout，实测真任务
+        # （查记忆、跑脚本）3 分钟根本跑不完 —— CLI 干得好好的就被强杀，
+        # 会话没有结尾回复，桌面打开渲染成「任务被中断」。headless 任务没有
+        # 交互等待，放宽到 30min。轮询期只探测 sid（不复制不登记），登记统一
+        # 放到进程结束后：半截会话提前登记会被桌面渲染成「任务被中断」并缓存。
+        hard_deadline = started + 1800
+        while True:
+            rc = proc.poll()
+            if not sid:
+                sid = _cli_session_land(started, cwd, text, mode="detect")
+            if rc is not None:
+                break
+            if time.time() > hard_deadline:
+                proc.kill()
+                if sid and cwd:
+                    _cli_session_land(started, cwd, text, mode="terminated")
+                outf.close()
+                errf.close()
+                return {"ok": False, "kind": "job",
+                        "err": "CLI 任务超 30 分钟未结束，已终止（会话仍可在侧边栏查看）"}
+            time.sleep(2.0)
+        outf.seek(0)
+        errf.seek(0)
+        out = outf.read().decode("utf-8", "replace").strip()
+        err = errf.read().decode("utf-8", "replace").strip()
+        outf.close()
+        errf.close()
+        # 未登录时 CLI 的退出码仍是 0，只把 "Authentication required" 写到 stderr 且
+        # stdout 为空（实测 2026-11-05）。不判这一条会把「根本没跑」当成功回执。
+        if rc != 0 or "Authentication required" in err or (not out and err):
+            tail = err or out
+            if sid and cwd:      # 半截会话以 terminated 落盘，供查看死前轨迹
+                _cli_session_land(started, cwd, text, mode="terminated")
+            return {"ok": False, "kind": "job",
+                    "err": f"CLI 退出码 {rc}：{tail[:200]}"}
+        if sid:
+            # 跑完后一次性复制终版 jsonl + completed 登记 + 触发侧边栏自动刷新
+            final_sid = _cli_session_land(started, cwd, text, mode="final")
+            sid = final_sid or sid
+            return {"ok": True, "kind": "job", "sessionId": sid,
+                    "detail": "已通过 CLI 新建任务（无网关 worker）",
+                    "text": out[:200]}
+        return {"ok": True, "kind": "job", "detail": "已通过 CLI 新建任务（无网关 worker）",
+                "text": out[:200]}
     except Exception as e:
         return {"ok": False, "kind": "job", "err": f"CLI 调用失败：{e}"}
-    if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "").strip()
-        return {"ok": False, "kind": "job",
-                "err": f"CLI 退出码 {r.returncode}：{tail[:200]}"}
-    return {"ok": True, "kind": "job", "detail": "已通过 CLI 新建任务（无网关 worker）",
-            "text": (r.stdout or "").strip()[:200]}
 
 
-def wb_new_job(text: str, cwd: str | None = None, name: str | None = None) -> dict:
-    """派发一个新任务：优先 REST POST /api/v1/jobs，无可用 worker 时回退 CLI。"""
+def _job_state(job_id: str) -> dict:
+    """读后台任务的落盘状态（~/.workbuddy/jobs/<id>/state.json）。
+
+    为什么需要它：POST /api/v1/jobs 返回 200 只代表「任务记录建好了」，真正的
+    启动发生在之后 1~3 秒。实测 5.9.3 上子进程会因端口被占直接退出，而接口
+    那边依然是 200 —— 不查这个文件就会把失败当成成功回执给设备。
+    """
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".workbuddy", "jobs",
+                         str(job_id or ""), "state.json")
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _job_log_tail(job_id: str, limit: int = 400) -> str:
+    """取任务日志尾部：state.json 的 detail 只会写「session ended」，
+    真正的死因（端口占用 / 目录不存在 / 未登录）只在 job-<id>.log 里。"""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".workbuddy", "logs",
+                         "job-%s.log" % str(job_id or ""))
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read()[-limit:]
+    except Exception:
+        return ""
+
+
+def _job_failure(job_id: str, st: dict) -> tuple[str, str]:
+    """把「任务失败」翻译成 (给设备的一句话, 排查用原文)。"""
+    detail = str((st or {}).get("detail") or "")
+    tail = _job_log_tail(job_id).strip()
+    evidence = (tail or detail).strip()
+    return _job_fail_hint(evidence + " " + detail), (evidence or detail)
+
+
+def _job_fail_hint(detail: str) -> str:
+    d = detail or ""
+    if "EADDRINUSE" in d:
+        return "新任务起不来：端口被桌面端占用"
+    if "parent directory is missing" in d:
+        return "新任务起不来：默认目录不存在"
+    if "Authentication required" in d:
+        return "新任务通道未登录"
+    return "新任务起不来：" + (d[:60] or "未知原因")
+
+
+def _job_started(job_id: str, wait_s: float = 4.5) -> dict:
+    """等后台任务越过启动阶段。
+
+    返回 {} = 已进入运行（或本来就没状态文件，按旧版本乐观处理）；
+    返回状态字典 = 已判定失败（state=failed），detail 里是真实原因。
+    """
+    end = time.time() + max(0.0, wait_s)
+    last: dict = {}
+    while True:
+        st = _job_state(job_id)
+        if st:
+            last = st
+            stage = str(st.get("state") or "")
+            detail = str(st.get("detail") or "")
+            if stage == "failed":
+                return st
+            # 只有「已经越过 starting…」才算真的起来了：创建瞬间也是 working，
+            # 端口冲突要等子进程 exec 之后才发作（实测 2.5~3s）。
+            if stage in ("working", "running") and detail and "starting" not in detail:
+                return {}
+        if time.time() >= end:
+            break
+        time.sleep(0.4)
+    return {}
+
+
+def _wb_acp_port() -> int | None:
+    """找一个支持 ACP 的网关 worker 端口（不是所有 worker 都开了 ACP）。
+
+    2026-11-06 关键修正：优先选 **writer 空闲** 的 worker。writer 被当前
+    活跃会话占用的 worker 会把 session/new 直接 attach 到那个会话（无视
+    传入的新 sessionId，实测返回主会话 id）—— 这就是「语音任务发进了
+    当前窗口」的根源。全占用时仍返回占用中的端口，由 session/new 的
+    attach 检测快速失败，交给外层等 writer 释放。
+    """
+    live = {s["port"]: s for s in wb_live_sessions()}
+    cands: list[tuple[int, int]] = []
+    for p in _list_workbuddy_ports():
+        s = live.get(p)
+        free = not (s and s.get("writerOccupied"))
+        cands.append((0 if free else 1, p))
+    for _rank, p in sorted(cands):
+        if probe_worker(p):
+            return p
+    return None
+
+
+def _session_jsonl_path(sid: str, cwd: str) -> Path:
+    """ACP 会话的落盘 jsonl 路径（projects/<cwd-slug>/<sid>.jsonl）。
+
+    slug 规则实测：整体小写，**连续**非字母数字字符合并为一个 '-'
+    （如 "C:\\Users\\x" -> "c-users-x"；"2026-11-03" 的单 '-' 原样保留）。
+    """
+    out: list[str] = []
+    prev_dash = False
+    for ch in cwd:
+        if ch.isalnum():
+            out.append(ch.lower())
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    slug = "".join(out).strip("-")
+    return Path.home() / ".workbuddy" / "projects" / slug / f"{sid}.jsonl"
+
+
+def _session_landed(sid: str, cwd: str, wait_s: float = 10.0) -> bool:
+    """等 ACP 会话真正落盘（jsonl 出现即视为任务已被服务端受理）。
+
+    背景：2026-11-05 11:45 实测 worker 刚 spawn 1s 就被重置，session/prompt
+    返回 ok 但会话从未落盘 —— 「假成功」。宁可多等几秒验证，也不把假成功
+    回给设备。
+    """
+    p = _session_jsonl_path(sid, cwd)
+    end = time.time() + max(0.0, wait_s)
+    while not p.exists():
+        if time.time() >= end:
+            return False
+        time.sleep(0.5)
+    return True
+
+
+def _wbsess_note(msg: str) -> None:
+    """模块级小日志（守护是 pythonw，print 不可见）。"""
+    try:
+        with open(os.path.expanduser("~/.workbuddy/voice-sessions.log"),
+                  "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _wbsess_ai_title(sid: str) -> str:
+    """取 ACP 会话自己生成的标题（jsonl 里的 ai-title 事件），没有就返回空串。"""
+    try:
+        base = os.path.expanduser("~/.workbuddy/projects")
+        for name in os.listdir(base):
+            p = os.path.join(base, name, sid + ".jsonl")
+            if not os.path.exists(p):
+                continue
+            title = ""
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    if '"ai-title"' not in ln:
+                        continue
+                    try:
+                        o = json.loads(ln)
+                    except Exception:
+                        continue
+                    if o.get("type") == "ai-title" and o.get("aiTitle"):
+                        title = str(o["aiTitle"])
+            if title:
+                return title
+    except Exception:
+        pass
+    return ""
+
+
+_last_register_at = 0.0        # 最近一次成功补登记侧边栏的时间（诊断用）
+
+
+def _wb_nudge_refresh() -> None:
+    """让桌面端侧边栏刷新：对 WorkBuddy 主窗口做一次最小化+还原。
+
+    为什么只能这么做：桌面 renderer 只在窗口可见性/焦点变化时重读 sessions
+    表，外部直接 INSERT 的行不触发重绘就永远不显示 —— 用户此前的手动做法
+    （最小化再打开）正是唯一的刷新途径。这里把同一动作自动化：最小化 →
+    0.6s → 还原，桌面会重读会话列表，新任务即出现。整个动作约 1s，会短暂
+    抢一下焦点，这是目前已知唯一可靠的刷新方式。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+        kernel32 = ctypes.WinDLL("kernel32")
+
+        def _exe_of(hwnd) -> str:
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            k32 = kernel32.OpenProcess(0x1000, False, pid.value or 0)  # QUERY_LIMITED
+            if not k32:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                size = wintypes.DWORD(512)
+                if kernel32.QueryFullProcessImageNameW(
+                        k32, 0, buf, ctypes.byref(size)):
+                    return os.path.basename(buf.value or "")
+            finally:
+                kernel32.CloseHandle(k32)
+            return ""
+
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        hits: list = []
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+        def _cb(hwnd, lparam):
+            if user32.IsWindowVisible(hwnd) and _exe_of(hwnd) == "WorkBuddy.exe":
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n > 0:                      # 有标题的才是主窗口，弹窗/托盘壳不算
+                    hits.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumProc(_cb), 0)
+        if not hits:
+            return
+        # 最小化再还原：正是用户手动验证过的「能刷出列表」的动作
+        user32.ShowWindow(hits[0], 6)          # SW_MINIMIZE
+        time.sleep(0.6)
+        user32.ShowWindow(hits[0], 9)          # SW_RESTORE
+        _wbsess_note("侧边栏已自动刷新（最小化+还原 WorkBuddy 主窗口）")
+    except Exception as e:
+        _wbsess_note(f"侧边栏自动刷新失败: {e}")
+
+
+def _wbsess_register(sid: str, cwd: str, text: str, status: str = "completed") -> bool:
+    """把 ACP 新建的会话补登记进 workbuddy.db 的 sessions 表。
+
+    为什么必须补：ACP session/new 只在网关进程内建会话，并把对话写进
+    projects/<slug>/<sid>.jsonl，**从不写 sessions 表**。结果是任务真的在跑
+    （jsonl 里有 ai-title、有回复、有 token 消耗），桌面侧边栏却一条都看不到，
+    用户只能看到当前会话的标题在变 —— 于是判定"没新建任务"（2026-11-05 实测：
+    01a1a9d6 / 01a1a9dd / 01a1a9eb 三个会话都是这样，01a1a9eb 有 4771B 完整
+    对话）。这里按桌面端自己的行格式补齐，字段照抄同 cwd 的现有会话，让新任务
+    落在同一个空间/任务分组里。
+
+    status：CLI 任务是先登记后跑完的，首次登记传 'working'（与桌面进行中
+    会话一致），跑完终版同步时改 'completed' —— 一直写 completed 会让桌面
+    打开时把没有结尾回复的会话渲染成「任务被中断」（2026-11-06 实测）。
+    """
+    global _last_register_at
+    try:
+        now = int(time.time() * 1000)
+        con = sqlite3.connect(DB, timeout=5)
+        try:
+            if con.execute("select 1 from sessions where id=?", (sid,)).fetchone():
+                if status:
+                    con.execute("update sessions set status=?, updated_at=? where id=?",
+                                (status, now, sid))
+                    con.commit()
+                return True
+            tpl = ("select user_id,is_playground,model,permission_mode,use_sandbox_cli,"
+                   "thought_level,source_mode,mode from sessions "
+                   "where cwd=? and deleted_at is null order by updated_at desc limit 1")
+            row = con.execute(tpl, (cwd,)).fetchone()
+            if not row:     # 该 cwd 还没会话：退到全库取一条，只借用户与默认值
+                row = con.execute(
+                    tpl.replace("where cwd=? and", "where")).fetchone()
+            (uid, pg, model, pmode, sandbox, tlvl, smode,
+             mode) = row or (None, 1, "fast-model", "fullAccess", 1,
+                             "medium", "craft", "craft")
+            title = (_wbsess_ai_title(sid) or (text or "").strip()[:24]
+                     or "设备语音任务")[:60]
+            con.execute(
+                "insert or ignore into sessions (id,cwd,user_id,title,status,created_at,"
+                "updated_at,last_activity_at,is_playground,source_mode,mode,model,"
+                "permission_mode,use_sandbox_cli,thought_level,transport,unread)"
+                " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (sid, cwd, uid, title, status or "completed", now, now, now,
+                 1 if pg is None else pg, smode or "craft", mode or "craft",
+                 model or "fast-model", pmode or "fullAccess",
+                 1 if sandbox is None else sandbox, tlvl or "medium", "local"))
+            con.commit()
+            _last_register_at = time.time()
+            threading.Thread(target=_wb_nudge_refresh, daemon=True).start()
+            return True
+        finally:
+            con.close()
+    except Exception as e:
+        _wbsess_note(f"sessions 登记失败 {sid[:8]}: {e}")
+        return False
+
+
+def wb_acp_new_job(text: str, cwd: str) -> dict:
+    """ACP 通道新建「独立新任务」会话（2026-11-05 实测打通的主通道）。
+
+    为什么不走 REST /api/v1/jobs：桌面端 spawn 的任务子进程继承网关自己的
+    SERVER__PORT，必然 EADDRINUSE（5.9.3 缺陷，接口也不接受端口覆盖）。
+    为什么不指望 CLI 兜底：CLI 未登录，且鉴权是桌面端经 credential-bootstrap
+    控制管道下发的（app.asar 内可见），独立进程拿不到，只能交互式 /login。
+
+    ACP session/new 在网关进程内建会话：复用桌面登录态、不抢端口。实测新
+    会话能真正执行工具（Write 落盘验证通过），且客户端提前断开任务照常跑完
+    （与 reply 模式同一条已验证的性质）。
+    坑：同一 ACP 连接上**第一次 session/new 会返回当前已有会话**（cwd 命中
+    复用），必须丢弃；之后每次带全新 sessionId 才是独立新会话。用已知会话
+    id 集合（DB 全量 + live）校验返回值，命中旧会话就换 uuid 重试。
+    整个流程自带一次重试：worker 刚 spawn 时可能秒断（prompt 返回 ok 但会
+    话没落盘，见 _session_landed），重试一次往往第二次就落到稳定 worker 上。
+    """
+    last: dict = {}
+    for attempt in range(2):
+        res = _wb_acp_new_job_once(text, cwd)
+        if res.get("ok"):
+            return res
+        last = res
+        if str(res.get("err") or "").startswith("worker 正被当前会话占用"):
+            return res          # attach 场景：重试同 worker 也不会变好，交给外层等释放
+        time.sleep(2.0)
+    return last
+
+
+def _delayed_acp_close(port: int, secret: str, cid: str,
+                       delay: float = 60.0) -> None:
+    """延迟断开 ACP 连接。
+
+    为什么不等投递完立刻断：prompt 一被接受就 DELETE，桌面端会把任务显示成
+    「任务被中断」（实测 2026-11-05 17:33 的 01a1ab0e，任务实际 54s 跑完了，
+    jsonl 完整，但 UI 显示中断）。拖 60s 让任务头几步的流事件走完再断；
+    参照 reply 模式的已验证性质，客户端断开不影响任务继续执行。
+    """
+    time.sleep(delay)
+    try:
+        _wb_http(port, "/api/v1/acp", secret, method="DELETE",
+                 headers={"acp-connection-id": cid}, timeout=4.0)
+    except Exception:
+        pass
+
+
+def _wb_acp_new_job_once(text: str, cwd: str) -> dict:
+    port = _wb_acp_port()
+    if not port:
+        return {"ok": False, "kind": "job", "err": "没有可用的 ACP worker 端口"}
+    secret = wb_gateway_secret()
+    known: set[str] = set()
+    try:
+        con = sqlite3.connect(DB, timeout=3)
+        known = {r[0] for r in con.execute("select id from sessions")}
+        con.close()
+    except Exception:
+        pass
+    try:
+        known |= {s.get("sessionId") for s in wb_live_sessions()}
+    except Exception:
+        pass
+    known.discard(None)
+    cid = None
+    rid = 1
+    try:
+        code, body = _wb_http(port, "/api/v1/acp/connect", secret,
+                              method="POST", timeout=8.0)
+        cid = json.loads(body).get("connectionId")
+        _wb_acp_rpc(port, secret, cid, 1, "initialize",
+                    {"protocolVersion": 1, "capabilities": {},
+                     "clientInfo": {"name": "codebuddy-web-ui", "version": "1.0"}},
+                    timeout=20.0)
+        sid = ""
+        for rid in range(2, 6):
+            r, _n = _wb_acp_rpc(port, secret, cid, rid, "session/new",
+                                {"cwd": cwd, "mcpServers": [],
+                                 "sessionId": str(uuid.uuid4())}, timeout=40.0)
+            sid = str(((r or {}).get("result") or {}).get("sessionId") or "")
+            if sid and sid not in known:
+                break
+            if sid and sid in known:
+                # attach 场景（2026-11-06 实测定性）：worker 把调用者挂到
+                # 已有会话（writer 被当前活跃会话占用），同端口重试无意义，
+                # 立即失败换端口/等 writer 释放，不烧 4×40s。
+                _wb_dbg(f"session/new 被 attach 到已知会话 {sid[:8]}"
+                        f"（端口 :{port} writer 占用），放弃该端口")
+                sid = ""
+                break
+            _wb_dbg(f"session/new#{rid} sid=(空) resp="
+                    f"{json.dumps(r, ensure_ascii=False)[:160]}")
+            sid = ""
+        else:
+            return {"ok": False, "kind": "job",
+                    "err": "worker 正被当前会话占用，新任务暂无法独立创建，稍后再试"}
+        # prompt 被接受即返回（实测 session_info_update ~0.1s 到），断开不影响
+        # 任务继续执行 —— 设备不必等整轮任务跑完。
+        r2, _n2 = _wb_acp_rpc(port, secret, cid, rid + 1, "session/prompt",
+                              {"sessionId": sid, "prompt": [
+                                  {"type": "text", "text": text}]},
+                              timeout=30.0, abort_after=2)
+        err = (r2 or {}).get("error")
+        if err:
+            return {"ok": False, "kind": "job", "sessionId": sid,
+                    "err": "会话已建但任务投递失败：" + str(err)[:120]}
+        # 落盘验证：prompt 返回 ok 不代表任务真的跑起来了（worker 秒断会
+        # 吞掉整轮），jsonl 没出现就按失败处理，交给外层重试。
+        if not _session_landed(sid, cwd):
+            return {"ok": False, "kind": "job", "sessionId": sid,
+                    "err": "任务会话未能落盘（worker 不稳定），待重试"}
+        # 补登记 sessions 表：ACP 会话只写 jsonl，不写 DB，侧边栏就看不到
+        # 这条新任务（用户会以为"没建成，只是把当前会话改了名"）。
+        if _wbsess_register(sid, cwd, text):
+            _wbsess_note(f"已登记 {sid[:8]} cwd={cwd} title={(text or '')[:20]}")
+        else:
+            _wbsess_note(f"登记失败 {sid[:8]}（任务仍在跑，只是侧边栏不显示）")
+        return {"ok": True, "kind": "job", "port": port, "sessionId": sid,
+                "detail": "已创建新任务（后台运行中）"}
+    except Exception as e:
+        return {"ok": False, "kind": "job", "err": f"ACP 新任务通道异常：{e}"}
+    finally:
+        if cid:
+            # 立刻断开会把任务显示成「任务被中断」（见 _delayed_acp_close 注释），
+            # 改为后台拖 60s 再断，投递返回不被拖住。
+            threading.Thread(target=_delayed_acp_close,
+                             args=(port, secret, cid), daemon=True).start()
+
+
+def wb_new_job(text: str, cwd: str | None = None, name: str | None = None,
+               wait_gateway_s: float = 45.0) -> dict:
+    """派发一个新任务：ACP 通道优先（实测唯一可靠的独立任务通道），
+    失败再走 REST POST /api/v1/jobs（受桌面端端口冲突影响，多为兜底），
+    最后 CLI。200 之后再验一次「是否真的起来了」，失败时把原因回给设备。
+
+    wait_gateway_s：桌面端网关 worker 随会话回合生灭（PC 助手空闲时整个
+    网关不存在，实测空窗可达数分钟），语音指令常落在空窗里 —— 发现没有
+    worker 就每 3s 重探一次，等桌面端拉起新 worker（用户碰一下 WorkBuddy
+    或下一个回合开始就会出现），最长等 45s 再宣告失败。
+    """
     cfg = wb_job_cfg_get()
     cwd = (cwd or cfg.get("cwd") or "").strip()
     name = (name or "").strip() or text.strip()[:24] or "设备语音任务"
+    deadline = time.time() + max(0.0, wait_gateway_s)
+    acp: dict = {}
+    while True:
+        acp = wb_acp_new_job(text, cwd)
+        if acp.get("ok"):
+            return acp
+        # 「未能落盘」= worker 秒断吞掉了任务，worker 会在几秒内重生，
+        # 继续在窗口期里重试往往下一发就中（内层已重试过一次）。
+        transient = ("没有可用的 ACP worker 端口" in str(acp.get("err") or "")
+                     or "未能落盘" in str(acp.get("err") or "")
+                     or "worker 正被当前会话占用" in str(acp.get("err") or "")
+                     or not wb_gateway_secret())
+        if not (transient and time.time() < deadline):
+            break
+        # 2026-11-05：空窗期不再干等桌面端自己拉 worker —— 桌面守护常驻
+        # 预热 worker（--prewarm），主动 activate 一个立刻可用（带登录态），
+        # 激活后本循环下一轮 wb_acp_new_job 就能投出去。
+        if not _list_workbuddy_ports() or not any(probe_worker(p) for p in _list_workbuddy_ports()):
+            _prewarm_wake(cwd, wait_s=12.0)
+        time.sleep(3.0)
     secret = wb_gateway_secret()
     if secret:
         cands = [s["port"] for s in wb_live_sessions()]
@@ -1219,8 +1985,21 @@ def wb_new_job(text: str, cwd: str | None = None, name: str | None = None) -> di
                     data = json.loads(body).get("data") or {}
                 except Exception:
                     data = {}
+                jid = str(data.get("id") or "")
+                st = _job_started(jid)
+                if st:
+                    # 2026-11-06：REST 建的任务常因「桌面 worker 无登录态」起不来
+                    # （日志 Authentication required）。独立 CLI 已登录，此时直接
+                    # 转 CLI 兜底，而不是把失败回给设备。
+                    hint, detail = _job_failure(jid, st)
+                    cli = _wb_cli_fallback(text, cwd or None)
+                    if cli.get("ok"):
+                        return cli
+                    return {"ok": False, "kind": "job", "port": port,
+                            "jobId": jid, "sessionId": data.get("sessionId"),
+                            "err": hint, "detail": detail}
                 return {"ok": True, "kind": "job", "port": port,
-                        "jobId": data.get("id"), "sessionId": data.get("sessionId"),
+                        "jobId": jid, "sessionId": data.get("sessionId"),
                         "detail": "已派发新任务"}
             if code == 404:
                 continue            # 该端口不是 REST worker，换下一个
@@ -1238,8 +2017,9 @@ def wb_new_job(text: str, cwd: str | None = None, name: str | None = None) -> di
 def _wb_fallback_hint(raw: str) -> str:
     """把回退失败翻译成"缺什么 + 下一步做什么"。这句话会原样进设备回执。"""
     if not wb_gateway_secret(force=True):
-        return ("WorkBuddy 本地网关没在运行（取不到网关密钥）："
-                "请在 WorkBuddy 里打开或跑一个会话后重试")
+        return ("PC 端 WorkBuddy 空闲中（网关未运行），已等待仍未恢复。"
+                "在电脑上打开任一会话后重试；或终端 codebuddy /login 一次，"
+                "之后空闲时也能直接建新任务")
     if not wb_cli_path():
         return "没有可用的投递通道：网关不在线，也没找到 WorkBuddy CLI"
     if "Authentication required" in raw or "/login" in raw:
@@ -1263,7 +2043,7 @@ def _wb_cli_fallback(text: str, cwd: str | None) -> dict:
     return res
 
 
-def wb_deliver(text: str, target: str = "reply") -> dict:
+def _wb_deliver_impl(text: str, target: str = "reply") -> dict:
     """统一投递入口。target: reply=回复当前会话 / job=新建任务。
 
     reply 走 ACP 优先（不要求会话是活的），失败再回退 REST reply ——
@@ -1273,7 +2053,20 @@ def wb_deliver(text: str, target: str = "reply") -> dict:
     if not text:
         return {"ok": False, "kind": target, "err": "内容为空"}
     if target == "job":
-        return wb_new_job(text)
+        res = wb_new_job(text)
+        if res.get("ok"):
+            return res
+        # 任务进程被桌面端端口冲突挡住时，改由我们自己起一个 headless CLI（独立
+        # 端口、独立会话）。CLI 未登录会失败，此时把两条链路的结论一起回给设备。
+        if "EADDRINUSE" in str(res.get("detail") or ""):
+            alt = _wb_cli_fallback(text, wb_job_cfg_get().get("cwd") or None)
+            if alt.get("ok"):
+                return alt
+            ce = str(alt.get("err") or "")
+            if "Authentication required" in ce or "/login" in ce:
+                res["err"] = "新任务未登录：终端 codebuddy 里 /login 一次"
+            res["cli_err"] = ce
+        return res
     res = wb_acp_deliver(text)
     if res.get("ok"):
         return res
@@ -1284,6 +2077,116 @@ def wb_deliver(text: str, target: str = "reply") -> dict:
         res2["acp_err"] = res.get("err")
         return res2
     res["rest_err"] = res2.get("err")
+    return res
+
+
+# ---- 语音任务账本：控制台「语音任务」实时列表的数据源 ----
+# 为什么不直接读 sessions 表：我们登记的行桌面端不会回写状态，且无法区分
+# 哪些来自语音。这里自记一本：每次 job 投递（成功/失败）都落一条 JSON，
+# 状态由 jsonl 的最近修改时间推断（ACP 会话跑一轮必写文件）。
+VOICE_JOBS_PATH = os.path.expanduser("~/.workbuddy/voice-jobs.json")
+VOICE_JOBS_MAX = 50
+VOICE_JOB_ACTIVE_S = 90.0        # jsonl 最近 90s 内有写入视为「运行中」
+
+
+def _voice_jobs_record(res: dict, text: str) -> None:
+    try:
+        items: list = []
+        if os.path.exists(VOICE_JOBS_PATH):
+            with open(VOICE_JOBS_PATH, encoding="utf-8") as f:
+                items = json.load(f) or []
+        items.insert(0, {
+            "at": int(time.time() * 1000),
+            "ok": bool(res.get("ok")),
+            "sid": str(res.get("sessionId") or ""),
+            "jobId": str(res.get("jobId") or ""),
+            "port": res.get("port"),
+            "title": (text or "").strip()[:40] or "(空)",
+            "err": "" if res.get("ok") else str(res.get("err") or "")[:120],
+        })
+        with open(VOICE_JOBS_PATH, "w", encoding="utf-8") as f:
+            json.dump(items[:VOICE_JOBS_MAX], f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        _wbsess_note(f"任务账本写入失败: {e}")
+
+
+def _voice_job_state(item: dict) -> str:
+    """running / done / failed / sent（无会话 id 可查时）。"""
+    if not item.get("ok"):
+        return "failed"
+    sid = str(item.get("sid") or "")
+    if not sid:
+        return "sent"
+    try:
+        base = os.path.expanduser("~/.workbuddy/projects")
+        for name in os.listdir(base):
+            p = os.path.join(base, name, sid + ".jsonl")
+            if os.path.exists(p):
+                age = time.time() - os.path.getmtime(p)
+                return "running" if age < VOICE_JOB_ACTIVE_S else "done"
+    except Exception:
+        pass
+    return "done"
+
+
+def wb_voice_jobs_list(limit: int = 20) -> list[dict]:
+    try:
+        with open(VOICE_JOBS_PATH, encoding="utf-8") as f:
+            items = json.load(f) or []
+    except Exception:
+        return []
+    out = []
+    for it in items[:limit]:
+        it = dict(it)
+        it["state"] = _voice_job_state(it)
+        out.append(it)
+    return out
+
+
+_deliver_lock = threading.Lock()
+_deliver_inflight: dict = {}       # 归一化文本 -> threading.Event（投递中）
+_deliver_inflight_res: dict = {}   # 归一化文本 -> 首发结果（供重发方取用）
+
+
+def wb_deliver(text: str, target: str = "reply") -> dict:
+    """wb_deliver 包装：job 投递结果无论成败都记进「语音任务」账本，
+    供控制台实时列表展示（设备语音与手工投递共用此入口）。
+
+    2026-11-06 去重：job 投递可能耗时数分钟（ACP 空窗重试 + CLI 兜底跑完整
+    任务），设备等不到回执会原样重发同一条语音 —— 实测同一句 4 秒的话被
+    并行执行了 4 次（01a1ad55×2 / 01a1ad57 / 01a1ad58），token 白烧三份。
+    这里按归一化文本去重：重发的指令直接等首发结果，不再起第二套投递。
+    """
+    if target != "job":
+        return _wb_deliver_impl(text, target)
+    key = " ".join((text or "").split())[:120]
+    with _deliver_lock:
+        ev = _deliver_inflight.get(key)
+        owner = ev is None
+        if owner:
+            ev = threading.Event()
+            _deliver_inflight[key] = ev
+    if not owner:
+        # 同文任务已在投递：等首发的最终结果（设备重发 / 用户连说两遍）
+        if not ev.wait(timeout=300):
+            return {"ok": False, "kind": "job",
+                    "err": "同文任务仍在投递中（已等待 5 分钟），请稍后在侧边栏查看"}
+        with _deliver_lock:
+            first = _deliver_inflight_res.get(key) or {
+                "ok": False, "kind": "job", "err": "首发结果已丢失"}
+        res = dict(first)
+        res["dedup"] = True
+        return res
+    try:
+        res = _wb_deliver_impl(text, target)
+    except Exception as e:
+        res = {"ok": False, "kind": "job", "err": f"投递异常：{e}"}
+    finally:
+        with _deliver_lock:
+            _deliver_inflight_res[key] = res
+            _deliver_inflight.pop(key, None)
+        ev.set()
+    _voice_jobs_record(res, text)
     return res
 
 
@@ -2979,12 +3882,20 @@ def read_wav_mono16k(path: str) -> tuple[bytes, int, float]:
 
 
 def collect_relay_text(relay: "_RelayWindow", quiet_s: float = RELAY_QUIET_S,
-                       timeout_s: float = RELAY_MAX_WAIT_S) -> str:
-    """等输入法把字打完：文字静默 quiet_s 秒即认为说完了。"""
+                       timeout_s: float = RELAY_MAX_WAIT_S, should_abort=None) -> str:
+    """等输入法把字打完：文字静默 quiet_s 秒即认为说完了。
+
+    should_abort 每 0.1s 回调一次，返回 True 立刻放弃。用途见设备链路：
+    两段录音间隔小于取字超时（12s）时，上一轮的取字还没结束，新一轮已经
+    开始并抢了焦点 —— 旧线程必须马上退出，否则它既会把新一段的字当成自己
+    的（投错目标），收尾时还会把新一轮的中转窗口隐藏掉。
+    """
     deadline = time.monotonic() + timeout_s
     text = ""
     last_change = time.monotonic()
     while time.monotonic() < deadline:
+        if should_abort is not None and should_abort():
+            return ""
         now = relay.text()
         if now != text:
             text, last_change = now, time.monotonic()
@@ -3150,6 +4061,7 @@ class VoiceSession:
     def __init__(self, session_id: int, target: str) -> None:
         self.session_id = session_id
         self.target = target          # reply / job / manual，来自设备的 msg_target 帧
+        self.gen = 0                  # 录音代号：新一轮开始即 +1，旧轮的取字靠它自我放弃
         self.pcm = bytearray()
         self.frames = 0
         self.samples = 0
@@ -3315,6 +4227,7 @@ class UnifiedDaemon:
         self._cable = _CableWriter()
         self._relay = _RelayWindow()
         self._asr_last_inject = 0.0
+        self._asr_gen = 0            # 录音代号（每轮 +1）：旧一轮取字据此自我放弃
         self._asr_active = False     # 本轮是不是我们启动的听写（开始/结束必须配对）
         self._asr_guard_timer: threading.Timer | None = None  # 保险丝句柄：新保险丝要撤旧的
         # TCP 上行消费队列：读循环只负责收字节，ADPCM 解码/声卡写入放到独立
@@ -3602,6 +4515,8 @@ class UnifiedDaemon:
             sess = None
         if rec and sess is None:
             sess = VoiceSession(sid, self._voice_target)
+            self._asr_gen += 1              # 新一轮：上一轮还在取的字段就此作废
+            sess.gen = self._asr_gen
             self._voice_sess = sess
             self._log(f"[voice] 开始录音 session={sid} target={self._voice_target}")
             # 起听写要抢焦点 + 敲热键，都是阻塞动作：丢线程，别卡住 BLE 回调。
@@ -3790,9 +4705,13 @@ class UnifiedDaemon:
         self._log(f"[voice] 快捷键注入失败：{spec}（{why}）")
         return False
 
-    def _asr_collect(self) -> str:
-        """等输入法把字打完（实现见模块级 collect_relay_text，自检模式共用）。"""
-        return collect_relay_text(self._relay)
+    def _asr_collect(self, sess: VoiceSession) -> str:
+        """等输入法把字打完（实现见模块级 collect_relay_text，自检模式共用）。
+
+        传 sess 的代号做中止判断：新一轮录音一开始，本轮立刻放弃取字。
+        """
+        return collect_relay_text(
+            self._relay, should_abort=lambda: sess.gen != self._asr_gen)
 
     async def _voice_deliver_task(self, sess: VoiceSession, path: str) -> None:
         """交付一轮录音：先取字、再按目标投递，最后把结果回给设备。"""
@@ -3802,15 +4721,19 @@ class UnifiedDaemon:
         if sess.seconds < 0.3:
             await self._send_voice_receipt(False, "录音太短")
             return
-        text, ok = await asyncio.to_thread(self._asr_deliver, sess, path)
+        res = await asyncio.to_thread(self._asr_deliver, sess, path)
+        if res is None:
+            # 被新一轮打断：回执由新一轮负责，这里不说话，免得设备连弹两条。
+            return
+        text, ok = res
         await self._send_voice_receipt(ok, text)
 
-    def _asr_deliver(self, sess: VoiceSession, path: str) -> tuple[str, bool]:
+    def _asr_deliver(self, sess: VoiceSession, path: str) -> tuple[str, bool] | None:
         """取字 → 投递（在工作线程里跑）。
 
         目标语义（设备菜单里选的）：
           reply  -> ACP session/prompt 投进会话（不要求会话是活的；失败回退 REST reply）
-          job    -> POST /api/v1/jobs（新建任务）
+          job    -> 新建独立任务
           manual -> 只把字留在中转窗口，不投递
         """
         try:
@@ -3818,15 +4741,22 @@ class UnifiedDaemon:
         finally:
             # 中转窗口在开录时就亮出来了（抢焦点接字），除 manual 档外用完即收 ——
             # 它抢过焦点、又占着屏幕底部，不该一直挂在桌面上。
-            if sess.target != "manual":
+            # 但**必须确认这仍是最后一轮**：12s 的取字窗口里用户可能已经开口说下一段，
+            # 那一轮正指着这个窗口收字，此时隐藏等于把新一段的话丢掉（2026-11-05 实测：
+            # 1.2s 的空录音把 9.2s 那段的中转窗口收走，取字 0 个、设备报未听清）。
+            if (sess.target != "manual" and sess.gen == self._asr_gen
+                    and self._voice_sess is None):
                 self._relay.hide()
 
-    def _asr_deliver_impl(self, sess: VoiceSession, path: str) -> tuple[str, bool]:
+    def _asr_deliver_impl(self, sess: VoiceSession, path: str) -> tuple[str, bool] | None:
         """取字与投递的实现；收窗口的收尾由 _asr_deliver 统一负责。"""
         if not self._asr_link_ready():
             self._log("[voice] 文字链路未就绪（缺虚拟声卡或总开关关了），本轮只存 WAV")
             return (f"已存录音 {sess.seconds:.0f}s", True)
-        text = self._asr_collect()
+        text = self._asr_collect(sess)
+        if sess.gen != self._asr_gen:
+            self._log(f"[voice] 第 {sess.session_id} 轮被新一轮打断，已放弃本轮取字")
+            return None
         stats = self._cable.stats()
         self._log(f"[voice] 取字 {len(text)} 个：{text[:60] or '（空）'}"
                   f"｜声卡 open={stats['open']} 写入={stats['bytes_written']}B "
@@ -4085,6 +5015,9 @@ class UnifiedDaemon:
             self._address = ip
             self._st.set(connected=True, address=ip)
             self._cfg_needs_push = True
+            # 新链路=新会话：目标收回「对话」。设备侧 handle_link 断链时也这么做，
+            # 两边同步，避免"设备显示对话、PC 还按新任务投递"。
+            self._voice_target = "reply"
             self._log(f"[daemon] TCP 已连接 {ip}:{port}(WiFi 通道)")
             try:
                 while True:
@@ -6270,6 +7203,22 @@ footer .sep{color:var(--line2)}
           <div id="wbResult" class="hint"></div>
         </div>
       </section>
+
+      <!-- 语音任务（实时账本：设备语音 / 手工投递的新任务都在这里） -->
+      <section class="card">
+        <div class="card-hd">
+          <div class="ibox"><svg class="i"><use href="#i-term"/></svg></div>
+          <h2>语音任务</h2>
+          <span class="chipst" id="vjBadge">--</span>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="refreshVoiceJobs()" aria-label="刷新语音任务">
+            <svg class="i" style="width:12px;height:12px"><use href="#i-refresh"/></svg>刷新
+          </button>
+        </div>
+        <div id="voiceJobs" style="padding:8px 15px 12px">
+          <div class="port empty">加载中…</div>
+        </div>
+      </section>
     </div>
 
     <div class="col">
@@ -7009,6 +7958,7 @@ async function wbSend(){
     wbShow(d);
     toast(d.ok ? '投递成功' : ('投递失败：' + (d.err || '')), d.ok ? 'ok' : 'err');
     refreshWbLive();
+    refreshVoiceJobs();
   }catch(e){
     wbShow({ok:false, err:'请求失败，请确认控制台服务在运行'});
     toast('投递失败', 'err');
@@ -7021,6 +7971,42 @@ function fillQuickPrompt(text){
   $('wbText').value = text;
   updateCharCount();
   $('wbText').focus();
+}
+
+/* ---------------- 语音任务账本（实时列表） ----------------
+   设备语音 / 控制台手工投递的新任务，后端在 wb_deliver 里统一记账；
+   状态由会话 jsonl 的最近写入时间推断，所以列表不用依赖桌面端刷新。 */
+const VJ_STATE = {
+  running:{t:'运行中', c:'ok'},
+  done:   {t:'已完成', c:'ok'},
+  failed: {t:'失败',   c:'er'},
+  sent:   {t:'已投递', c:''}
+};
+async function refreshVoiceJobs(){
+  const box = $('voiceJobs'); if(!box) return;
+  try{
+    const d = await (await fetch('/api/wb-jobs')).json();
+    const jobs = d.jobs || [];
+    const badge = $('vjBadge');
+    const nRun = jobs.filter(j=>j.state==='running').length;
+    if(badge){
+      badge.className = 'chipst ' + (nRun ? 'ok' : (jobs.length ? 'wn' : ''));
+      badge.textContent = nRun ? (nRun + ' 个运行中') : (jobs.length ? (jobs.length + ' 条') : '暂无');
+    }
+    if(!jobs.length){
+      box.innerHTML = '<div class="port empty">还没有投递记录 — 对设备说「新任务…」或在上方手工投递</div>';
+      return;
+    }
+    box.innerHTML = jobs.map(j=>{
+      const s = VJ_STATE[j.state] || VJ_STATE.sent;
+      const tm = new Date(j.at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+      const sub = j.state==='failed'
+        ? ('失败：' + esc(j.err||''))
+        : ('会话 ' + esc((j.sid||j.jobId||'').slice(0,8)) + (j.port ? ' · 端口 ' + esc(j.port) : ''));
+      return '<div class="port" title="'+sub+'"><span class="p">'+esc(j.title||'')+'</span>'
+        + '<span class="s'+(s.c==='er'?' off':'')+'">'+s.t+' · '+tm+'</span></div>';
+    }).join('');
+  }catch(e){}
 }
 
 function updateCharCount(){
@@ -7123,10 +8109,11 @@ $('palette').addEventListener('click', e=>{ if(e.target === $('palette')) closeP
 $('wbText').addEventListener('input', updateCharCount);
 if($('hostLine')) $('hostLine').textContent = location.host || '127.0.0.1';
 
-refreshStatus(); refreshLog(); refreshWbLive();
+refreshStatus(); refreshLog(); refreshWbLive(); refreshVoiceJobs();
 renderLog();
 setInterval(refreshStatus, 2000);
 setInterval(refreshLog, 2000);
+setInterval(refreshVoiceJobs, 5000);
 setInterval(tickUptime, 1000);
 </script>
 </body>
@@ -7174,6 +8161,12 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/wb-live":
             # 活会话概览：前端「设备发消息」卡片据此显示当前能投递到哪。
             self._send(200, json.dumps(wb_live_overview(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if self.path == "/api/wb-jobs":
+            # 语音任务账本：投递即记录，状态按 jsonl 新鲜度推断（详见账本注释）。
+            self._send(200, json.dumps({"jobs": wb_voice_jobs_list()},
+                                       ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain")
@@ -7478,6 +8471,9 @@ def main() -> int:
     parser.add_argument("--mac", help="设备 BLE 地址（否则扫描）")
     parser.add_argument("--port", type=int, default=IPC_PORT, help="IPC 审批端口（默认 48765）")
     parser.add_argument("--web-port", type=int, default=8000, help="Web UI 端口（默认 8000）")
+    parser.add_argument("--web-host", default="0.0.0.0",
+                        help="Web UI 绑定地址（默认 0.0.0.0，供家庭内其他主机/cloudflared 经 LAN 转发；"
+                             "设 127.0.0.1 则仅本机）")
     parser.add_argument("--credit-interval", type=float, default=CREDIT_INTERVAL,
                         help="周期积分推送秒数（0=禁用）")
     parser.add_argument("--no-daemon", action="store_true", help="只起 Web UI，不自动启动 daemon")
@@ -7524,7 +8520,7 @@ def main() -> int:
                                   credit_interval=args.credit_interval)
 
     try:
-        web = WebServer(st, controller, port=args.web_port)
+        web = WebServer(st, controller, host=args.web_host, port=args.web_port)
         web.start()
     except OSError as exc:
         print(f"Web UI 启动失败（端口 {args.web_port} 可能被占用）: {exc}", file=sys.stderr)
