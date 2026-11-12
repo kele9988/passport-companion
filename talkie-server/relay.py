@@ -201,20 +201,21 @@ class Relay:
                 await writer.drain()
                 return
 
-            # 同 devid 顶替：网页端重连或旧连接僵死时，同一台机会在房间里
+            # 同 devid 顶替：网页端重连或旧连接僵死时，同一台"机"会在房间里
             # 堆出多个会话、彼此转发音频，曾把 gateway 下行队列塞爆（一次会话
             # 拥塞丢弃 5 万帧，对端全程无声）。新连接 JOIN 时直接踢掉同房间
             # 同 devid 的旧连接，保证一台设备/一个网页端只占一个位置。
-            for stale in [p for p in list(members.values()) if p.devid == devid]:
+            for old in [p for p in list(members.values()) if p.devid == devid]:
                 log.info("[%s] %s 被新连接顶替,断开旧连接",
-                         room.decode("ascii", "replace"), stale.name)
-                members.pop(stale.pid, None)
+                         room.decode("ascii", "replace"), old.name)
+                members.pop(old.pid, None)
                 with contextlib.suppress(Exception):
-                    stale.queue.put_nowait(None)
-                if stale.sender:
-                    stale.sender.cancel()
+                    old.queue.put_nowait(None)
+                if old.sender:
+                    old.sender.cancel()
                 with contextlib.suppress(Exception):
-                    stale.writer.close()
+                    old.writer.close()
+
             peer.pid = self._next_id
             self._next_id = self._next_id % 0xFFFFFFFF + 1
             members[peer.pid] = peer

@@ -16,6 +16,9 @@ passport-companion/
 | --- | --- |
 | `relay.py` | 房间中转：设备/网关都以 TCP 客户端接入，按房间号互转 Opus 音频帧 |
 | `gateway.py` | 网页对端：把手机/电脑浏览器变成第二台对讲机（WebSocket PCM ↔ libopus） |
+| `ws_talk_bridge.py` | WS 桥：家庭宽带无公网 IP 时，经 Cloudflare Tunnel 让设备也能连上（依赖 `websockets`） |
+
+**完整部署指南（局域网 / VPS / 无公网 IP 三种方案 + systemd + 协议速查）**：见 [`talkie-server/README.md`](talkie-server/README.md)。
 
 **快速开始**（服务端机器上）：
 
@@ -27,7 +30,7 @@ python3 relay.py --host :: --port 7801 --token 8888
 python3 gateway.py --port 7802 --relay 127.0.0.1:7801
 ```
 
-**设备侧配置**：对讲机应用 → 设置中转主机（填本服务器的域名或 IP）与房间号，两台设备配同一房间即可通话。
+**设备侧配置**：对讲机 → 长按下键切到异地模式 → 双击下键选中房间号，待命后上下键加减（写入 NVS，重启保留）。服务器地址目前需一次性写入：USB 连电脑，串口工具（115200）发 `y<主机:端口>`（如 `yrelay.example.com:7801`）、`r<4位房间号>`，NVS 永久保存。
 
 **浏览器侧**：浏览器要求 HTTPS 或 localhost 才能给麦克风授权，局域网用 `http://<ip>:7802` 打开拿不到录音权限，请用 localhost 或 HTTPS 反代（Lucky/Cloudflare 等）。
 
